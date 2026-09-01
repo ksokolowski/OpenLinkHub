@@ -710,7 +710,7 @@ func GenerateAnimationScreenImage(values []float32) []Frames {
 		}
 	}
 
-	jpegOptions := jpeg.Options{Quality: 90}
+	jpegOptions := jpeg.Options{Quality: 80}
 
 	// The sensor readings are baked into every frame, so the whole animation was re-rendered and
 	// re-JPEG-encoded on every lcdRefreshInterval tick (1000 ms) even when nothing on screen had
