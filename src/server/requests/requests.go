@@ -602,7 +602,11 @@ func ProcessOperatingMode(r *http.Request) *Payload {
 		}
 	}
 
-	if req.OperatingMode < 1 || req.OperatingMode > 2 {
+	// Sanity only. The valid values are chip-specific and declared per board in
+	// database/motherboard/motherboard.json (it8696 uses 2 for BIOS, nct6799 uses 5), so the
+	// authoritative check lives in motherboards.SetMotherboardHeaderMode against that board's
+	// HeaderModes. A fixed 1-2 range here silently locks out any board whose BIOS mode differs.
+	if req.OperatingMode < 1 || req.OperatingMode > 255 {
 		return &Payload{Message: language.GetValue("txtUnableToValidateRequest"), Code: http.StatusOK, Status: 0}
 	}
 

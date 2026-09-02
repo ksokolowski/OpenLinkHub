@@ -122,17 +122,20 @@ func SetMotherboardHeaderMode(header, mode int) uint8 {
 	mutex.Lock()
 	defer mutex.Unlock()
 
-	if mode < 1 || mode > 2 {
-		logger.Log(logger.Fields{"mode": mode, "header": header}).Warn("Invalid PWM header mode")
-		return 0
-	}
-
 	m := GetMotherboard()
 	if m == nil {
 		return 0
 	}
 
 	if val, ok := m.Headers[header]; ok {
+		// Validate against the modes this board declares rather than a fixed range. The sysfs
+		// value for "BIOS" is chip-specific -- it8696 uses 2, but nct6799 uses 5 (Smart Fan IV),
+		// and 2 there is a different automatic mode. getBiosOperatingMode already resolves the
+		// value from HeaderModes, so the write path must accept whatever that returns.
+		if _, valid := val.HeaderModes[mode]; !valid {
+			logger.Log(logger.Fields{"mode": mode, "header": header}).Warn("Invalid PWM header mode")
+			return 0
+		}
 		pwmConfig := filepath.Join(hwmonPath, strings.TrimPrefix(val.HeaderConfig, "/"))
 		if common.FileExists(pwmConfig) {
 			err := os.WriteFile(pwmConfig, []byte(fmt.Sprintf("%d\n", mode)), 0)
