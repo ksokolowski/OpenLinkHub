@@ -106,6 +106,8 @@ type Device struct {
 	timer             *time.Ticker
 	timerSpeed        *time.Ticker
 	Exit              bool
+	pwmTarget         map[int]int // requested duty cycle per header
+	pwmActual         map[int]int // last value actually written (slew-limited)
 	deviceLock        sync.Mutex
 	instance          *common.Device
 }
@@ -406,7 +408,7 @@ func (d *Device) setDefaults() {
 			channelDefaults[device] = byte(defaultSpeedValue)
 		}
 	}
-	d.setSpeed(channelDefaults)
+	d.setSpeedNow(channelDefaults)
 }
 
 // setCpuTemperature will store current CPU temperature
@@ -701,18 +703,108 @@ func (d *Device) saveDeviceProfile() {
 	d.loadDeviceProfiles()
 }
 
+// Slew limits, in PERCENT per tick of the speed ticker (temperaturePullingInterval, 3s).
+// SetMotherboardHeaderValue takes 1-100 and converts to a duty cycle internally.
+//
+// Fan noise is dominated by how much the duty cycle MOVES, not where it sits: a curve that steps
+// between bands produces an audible surge even when the average speed is low. Limiting the rate of
+// change turns each step into a short ramp.
+//
+// Deliberately asymmetric -- fast attack, slow decay. Rising is cooling, so it must stay prompt
+// (32%/tick reaches full scale in ~3 ticks, about 9s); falling is comfort only, so it is gentle
+// (4%/tick takes ~55s to fall from 100% to the curve's 30% floor -- measured, not estimated).
+// Anything that needs an instant jump (initial state, a mode change) bypasses this via setSpeedNow.
+const (
+	slewUpMax   = 32
+	slewDownMax = 4
+)
+
 // setSpeed will generate a speed buffer and send it to a device
 func (d *Device) setSpeed(data map[int]byte) {
 	if d.Exit {
 		return
 	}
 
+	d.mutex.Lock()
+	if d.pwmTarget == nil {
+		d.pwmTarget = make(map[int]int)
+	}
 	for key, value := range data {
+		d.pwmTarget[key] = int(value)
+	}
+	d.mutex.Unlock()
+	// Deliberately NOT stepping here. setSpeed is called from nested loops -- once per device per
+	// matching profile band -- so stepping on every call multiplies the rate limit by the number of
+	// calls per tick (measured: a -4/tick decay limit became -163 in five seconds). The speed
+	// ticker is the single driver of applySlew.
+}
+
+// setSpeedNow writes values immediately, bypassing the slew limiter. Used where an instant result
+// is required: initial header defaults, and returning a header to a known state.
+func (d *Device) setSpeedNow(data map[int]byte) {
+	if d.Exit {
+		return
+	}
+	d.mutex.Lock()
+	if d.pwmTarget == nil {
+		d.pwmTarget = make(map[int]int)
+	}
+	if d.pwmActual == nil {
+		d.pwmActual = make(map[int]int)
+	}
+	d.mutex.Unlock()
+
+	for key, value := range data {
+		if motherboards.GetMotherboardHeaderMode(key) == d.getBiosOperatingMode(key) {
+			continue
+		}
+		motherboards.SetMotherboardHeaderValue(key, int(value))
+		d.mutex.Lock()
+		d.pwmTarget[key] = int(value)
+		d.pwmActual[key] = int(value)
+		d.mutex.Unlock()
+	}
+}
+
+// applySlew moves each header one step toward its target. It must be driven by the speed ticker as
+// well as by setSpeed: the curve only calls setSpeed when the temperature band CHANGES, so a
+// rate-limited value would otherwise stop partway and never converge.
+func (d *Device) applySlew() {
+	if d.Exit {
+		return
+	}
+
+	d.mutex.Lock()
+	if d.pwmActual == nil {
+		d.pwmActual = make(map[int]int)
+	}
+	pending := make(map[int]int, len(d.pwmTarget))
+	for key, target := range d.pwmTarget {
+		cur, seen := d.pwmActual[key]
+		next := target
+		if seen {
+			if next > cur+slewUpMax {
+				next = cur + slewUpMax
+			}
+			if next < cur-slewDownMax {
+				next = cur - slewDownMax
+			}
+		}
+		if !seen || next != cur {
+			pending[key] = next
+		}
+	}
+	d.mutex.Unlock()
+
+	for key, next := range pending {
 		if motherboards.GetMotherboardHeaderMode(key) == d.getBiosOperatingMode(key) {
 			// BIOS mode can not be updated from user-space
 			continue
 		}
-		motherboards.SetMotherboardHeaderValue(key, int(value))
+		motherboards.SetMotherboardHeaderValue(key, next)
+		d.mutex.Lock()
+		d.pwmActual[key] = next
+		d.mutex.Unlock()
 	}
 }
 
@@ -937,6 +1029,8 @@ func (d *Device) updateDeviceSpeed() {
 						}
 					}
 				}
+				// Converge toward targets even when no band changed this tick.
+				d.applySlew()
 			case <-d.speedRefreshChan:
 				d.timerSpeed.Stop()
 				return
