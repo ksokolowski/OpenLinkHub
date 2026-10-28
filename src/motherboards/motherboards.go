@@ -135,6 +135,12 @@ func SetMotherboardHeaderMode(header, mode int) uint8 {
 	}
 
 	if val, ok := m.Headers[header]; ok {
+		// The value behind each mode is chip specific (BIOS is 2 on it8696 and 5 on nct6799),
+		// so only accept the modes this board declares.
+		if _, declared := val.HeaderModes[mode]; !declared {
+			logger.Log(logger.Fields{"mode": mode, "header": header}).Warn("Invalid PWM header mode")
+			return 0
+		}
 		pwmConfig := filepath.Join(hwmonPath, strings.TrimPrefix(val.HeaderConfig, "/"))
 		if common.FileExists(pwmConfig) {
 			err := os.WriteFile(pwmConfig, []byte(fmt.Sprintf("%d\n", mode)), 0)
