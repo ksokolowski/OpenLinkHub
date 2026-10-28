@@ -90,6 +90,9 @@ var (
 		21: "Time",
 	}
 	sensorTextCache = make(map[uint8]string)
+	animCacheKey    string
+	animCacheFrames []Frames
+	animCacheMu     sync.Mutex
 	lcdPresent      = false
 	imageDataMutex  sync.RWMutex
 )
@@ -752,6 +755,55 @@ func GenerateAnimationScreenImage(values []float32) []Frames {
 
 	jpegOptions := jpeg.Options{Quality: 90}
 
+	// The sensor values are drawn into every frame, so without a cache the whole animation is
+	// rendered and JPEG-encoded on every refresh tick (1 s). Temperatures are only polled every
+	// 3 s, so most of those renders produce the same frames as the tick before.
+	//
+	// Build the displayed strings once, use them as the cache key, and reuse the previous frames
+	// when the key has not changed.
+	sensorTexts := make([]string, len(sensors))
+	for m := 0; m < len(sensors); m++ {
+		sensor := sensors[m]
+		if !sensor.Enabled {
+			continue
+		}
+		switch sensor.Sensor {
+		case SensorDate:
+			sensorTexts[m] = common.GetDate()
+		case SensorTime:
+			sensorTexts[m] = common.GetTime()
+		default:
+			var sensorValue float32
+			if sensor.Sensor == SensorTemperatureProbe {
+				sensorValue = stats.GetDeviceTemperature(sensor.DeviceId, sensor.ChannelId)
+			} else if int(sensor.Sensor) < len(values) {
+				sensorValue = values[sensor.Sensor]
+			}
+			sensorMax := sensorMaximumValue(sensor.Sensor)
+			if sensorValue > float32(sensorMax) {
+				sensorValue = float32(sensorMax)
+			}
+			if isSensorTemperature(sensor.Sensor) {
+				sensorTexts[m] = dashboard.GetDashboard().TemperatureToString(sensorValue)
+			} else if isSpeedTemperature(sensor.Sensor) {
+				sensorTexts[m] = fmt.Sprintf("%.0f RPM", sensorValue)
+			} else {
+				sensorTexts[m] = fmt.Sprintf("%.1f %%", sensorValue)
+			}
+		}
+	}
+
+	// The key covers everything that changes the pixels. Date and Time change the key every second.
+	cacheKey := fmt.Sprintf("%s|%d|%d|%s|%s", background, margin, z, separatorColor.Hex,
+		strings.Join(sensorTexts, "\x1f"))
+	animCacheMu.Lock()
+	if animCacheFrames != nil && animCacheKey == cacheKey {
+		cached := animCacheFrames
+		animCacheMu.Unlock()
+		return cached
+	}
+	animCacheMu.Unlock()
+
 	imageBuffer := make([]Frames, len(val))
 	var wg sync.WaitGroup
 	wg.Add(len(val))
@@ -799,38 +851,7 @@ func GenerateAnimationScreenImage(values []float32) []Frames {
 			for m := 0; m < len(sensors); m++ {
 				sensor := sensors[m]
 				if sensor.Enabled {
-					var valueText string
-
-					switch sensor.Sensor {
-					case SensorDate:
-						valueText = common.GetDate()
-
-					case SensorTime:
-						valueText = common.GetTime()
-
-					default:
-						var sensorValue float32
-						if sensor.Sensor == SensorTemperatureProbe {
-							sensorValue = stats.GetDeviceTemperature(sensor.DeviceId, sensor.ChannelId)
-						} else {
-							if int(sensor.Sensor) < len(values) {
-								sensorValue = values[sensor.Sensor]
-							}
-						}
-
-						sensorMax := sensorMaximumValue(sensor.Sensor)
-						if sensorValue > float32(sensorMax) {
-							sensorValue = float32(sensorMax)
-						}
-
-						if isSensorTemperature(sensor.Sensor) {
-							valueText = dashboard.GetDashboard().TemperatureToString(sensorValue)
-						} else if isSpeedTemperature(sensor.Sensor) {
-							valueText = fmt.Sprintf("%.0f RPM", sensorValue)
-						} else {
-							valueText = fmt.Sprintf("%.1f %%", sensorValue)
-						}
-					}
+					valueText := sensorTexts[m]
 					x, y := calculateStringXY(80, valueText)
 					drawColorString(x, y+padding, 80, valueText, canvas, sensor.TextColor)
 
@@ -859,6 +880,12 @@ func GenerateAnimationScreenImage(values []float32) []Frames {
 	}
 
 	wg.Wait()
+
+	animCacheMu.Lock()
+	animCacheKey = cacheKey
+	animCacheFrames = imageBuffer
+	animCacheMu.Unlock()
+
 	return imageBuffer
 }
 
