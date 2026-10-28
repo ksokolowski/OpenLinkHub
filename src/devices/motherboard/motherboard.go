@@ -106,6 +106,8 @@ type Device struct {
 	timer             *time.Ticker
 	timerSpeed        *time.Ticker
 	Exit              bool
+	pwmTarget         map[int]int // requested duty cycle per header
+	pwmActual         map[int]int // last value written (after the slew limit)
 	deviceLock        sync.Mutex
 	instance          *common.Device
 }
@@ -406,7 +408,7 @@ func (d *Device) setDefaults() {
 			channelDefaults[device] = byte(defaultSpeedValue)
 		}
 	}
-	d.setSpeed(channelDefaults)
+	d.setSpeedNow(channelDefaults)
 }
 
 // setCpuTemperature will store current CPU temperature
@@ -701,11 +703,50 @@ func (d *Device) saveDeviceProfile() {
 	d.loadDeviceProfiles()
 }
 
+// Slew limits in percent per tick of the speed ticker (temperaturePullingInterval, 3 s).
+// SetMotherboardHeaderValue takes 1-100 and converts it to a duty cycle.
+//
+// A curve that jumps between temperature bands makes the fans surge audibly, even at low average
+// speed. Limiting the change per tick turns each jump into a short ramp. Rising speed is cooling,
+// so it moves fast (32% per tick). Falling speed only affects noise, so it moves slowly (4% per
+// tick, about 55 s from 100% down to a 30% floor). Startup defaults skip the limit (setSpeedNow).
+const (
+	slewUpMax   = 32
+	slewDownMax = 4
+)
+
 // setSpeed will generate a speed buffer and send it to a device
 func (d *Device) setSpeed(data map[int]byte) {
 	if d.Exit {
 		return
 	}
+
+	d.mutex.Lock()
+	if d.pwmTarget == nil {
+		d.pwmTarget = make(map[int]int)
+	}
+	for key, value := range data {
+		d.pwmTarget[key] = int(value)
+	}
+	d.mutex.Unlock()
+	// Only record the target here. setSpeed can run several times per tick (once per device and
+	// matching profile band), so stepping here would multiply the limit. applySlew does the
+	// stepping, once per tick of the speed ticker.
+}
+
+// setSpeedNow writes values immediately, without the slew limit. Used for the startup defaults.
+func (d *Device) setSpeedNow(data map[int]byte) {
+	if d.Exit {
+		return
+	}
+	d.mutex.Lock()
+	if d.pwmTarget == nil {
+		d.pwmTarget = make(map[int]int)
+	}
+	if d.pwmActual == nil {
+		d.pwmActual = make(map[int]int)
+	}
+	d.mutex.Unlock()
 
 	for key, value := range data {
 		if motherboards.GetMotherboardHeaderMode(key) == d.getBiosOperatingMode(key) {
@@ -713,6 +754,52 @@ func (d *Device) setSpeed(data map[int]byte) {
 			continue
 		}
 		motherboards.SetMotherboardHeaderValue(key, int(value))
+		d.mutex.Lock()
+		d.pwmTarget[key] = int(value)
+		d.pwmActual[key] = int(value)
+		d.mutex.Unlock()
+	}
+}
+
+// applySlew moves each header one step toward its target. The speed ticker calls it on every tick,
+// because the curve only calls setSpeed when the temperature band changes, and a limited value
+// would otherwise stop partway.
+func (d *Device) applySlew() {
+	if d.Exit {
+		return
+	}
+
+	d.mutex.Lock()
+	if d.pwmActual == nil {
+		d.pwmActual = make(map[int]int)
+	}
+	pending := make(map[int]int, len(d.pwmTarget))
+	for key, target := range d.pwmTarget {
+		cur, seen := d.pwmActual[key]
+		next := target
+		if seen {
+			if next > cur+slewUpMax {
+				next = cur + slewUpMax
+			}
+			if next < cur-slewDownMax {
+				next = cur - slewDownMax
+			}
+		}
+		if !seen || next != cur {
+			pending[key] = next
+		}
+	}
+	d.mutex.Unlock()
+
+	for key, next := range pending {
+		if motherboards.GetMotherboardHeaderMode(key) == d.getBiosOperatingMode(key) {
+			// BIOS mode can not be updated from user-space
+			continue
+		}
+		motherboards.SetMotherboardHeaderValue(key, next)
+		d.mutex.Lock()
+		d.pwmActual[key] = next
+		d.mutex.Unlock()
 	}
 }
 
@@ -937,6 +1024,8 @@ func (d *Device) updateDeviceSpeed() {
 						}
 					}
 				}
+				// Keep stepping toward the targets even when no band changed this tick.
+				d.applySlew()
 			case <-d.speedRefreshChan:
 				d.timerSpeed.Stop()
 				return
